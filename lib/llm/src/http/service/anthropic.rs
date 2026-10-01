@@ -15,7 +15,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use axum::{
     Json, Router,
     body::Body,
-    extract::State,
+    extract::{Extension, State},
     http::{HeaderMap, Request, StatusCode},
     middleware::{self, Next},
     response::{
@@ -32,6 +32,7 @@ use tracing::Instrument;
 use super::{
     RouteDoc,
     disconnect::{ConnectionHandle, create_connection_monitor, monitor_for_disconnects},
+    flexprice,
     metrics::{CancellationLabels, Endpoint, process_response_and_observe_metrics},
     service_v2,
 };
@@ -127,9 +128,14 @@ async fn anthropic_error_middleware(request: Request<Body>, next: Next) -> Respo
 /// Top-level HTTP handler for POST /v1/messages.
 async fn handler_anthropic_messages(
     State((state, template)): State<(Arc<service_v2::State>, Option<RequestTemplate>)>,
+    maybe_org: Option<Extension<flexprice::OrgUuid>>,
+    maybe_user: Option<Extension<flexprice::UserUuid>>,
     headers: HeaderMap,
     Json(request): Json<AnthropicCreateMessageRequest>,
 ) -> Result<Response, Response> {
+    let org_uuid = maybe_org.map(|Extension(o)| o.0);
+    let user_uuid = maybe_user.map(|Extension(u)| u.0);
+
     // Validate required fields
     if request.messages.is_empty() {
         return Err(anthropic_error(
@@ -166,16 +172,18 @@ async fn handler_anthropic_messages(
     )
     .await;
 
-    let response =
-        tokio::spawn(anthropic_messages(state, template, request, stream_handle).in_current_span())
-            .await
-            .map_err(|e| {
-                anthropic_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "api_error",
-                    &format!("Failed to await messages task: {:?}", e),
-                )
-            })?;
+    let response = tokio::spawn(
+        anthropic_messages(state, template, request, stream_handle, org_uuid, user_uuid)
+            .in_current_span(),
+    )
+    .await
+    .map_err(|e| {
+        anthropic_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "api_error",
+            &format!("Failed to await messages task: {:?}", e),
+        )
+    })?;
 
     connection_handle.disarm();
     response
@@ -188,6 +196,8 @@ async fn anthropic_messages(
     template: Option<RequestTemplate>,
     mut request: Context<AnthropicCreateMessageRequest>,
     mut stream_handle: ConnectionHandle,
+    org_uuid: Option<String>,
+    user_uuid: Option<String>,
 ) -> Result<Response, Response> {
     let streaming = request.stream;
     let request_id = request.id().to_string();
@@ -214,6 +224,17 @@ async fn anthropic_messages(
     let model = request.model.clone();
     let metric_model = state.manager().metric_model_for(&model).to_string();
     let http_queue_guard = state.metrics_clone().create_http_queue_guard(&metric_model);
+
+    // No-op unless FlexPrice billing is enabled and the request has a JWT-verified org id.
+    let mut usage_guard = flexprice::UsageBillingGuard::new(
+        state.flexprice_client(),
+        state.flexprice_config(),
+        org_uuid.as_deref(),
+        user_uuid.as_deref(),
+        &request_id,
+        &metric_model,
+        streaming,
+    );
 
     tracing::trace!("Received Anthropic messages request: {:?}", &*request);
 
@@ -385,6 +406,10 @@ async fn anthropic_messages(
 
         let event_stream = engine_stream
             .inspect(move |response| {
+                // Usage arrives on the final chunk; the event is sent when the guard drops.
+                if let Some(data) = response.data.as_ref() {
+                    usage_guard.record_usage_opt(data.inner.usage.as_ref());
+                }
                 process_response_and_observe_metrics(
                     response,
                     &mut response_collector,
@@ -468,6 +493,8 @@ async fn anthropic_messages(
                         &format!("Failed to fold messages stream: {}", e),
                     )
                 })?;
+
+        usage_guard.record_usage_opt(chat_response.inner.usage.as_ref());
 
         let response = chat_completion_to_anthropic_response(
             chat_response,
